@@ -1,0 +1,396 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <SD.h>
+#include <SPI.h>
+#include "mbedtls/md.h"
+
+#define SD_CS 5
+#define BUZZER_PIN 4
+
+const char* hashed_master_key = "a30198efb03ef0200bb7966f79aba7695560e91cb96435a23eef8d24ecf58d6d";
+const char* ap_ssid = "ZenDrive_Ultra_Pro";
+const char* ap_pass = "12345678";
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// --- SHA256 Helper ---
+String sha256(String payload) {
+    byte shaResult[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, (const unsigned char *)payload.c_str(), payload.length());
+    mbedtls_md_finish(&ctx, shaResult);
+    mbedtls_md_free(&ctx);
+    String hash = "";
+    for (int i = 0; i < 32; i++) {
+        char str[3];
+        sprintf(str, "%02x", (int)shaResult[i]);
+        hash += str;
+    }
+    return hash;
+}
+
+// --- AI SMART SCANNER (Categorization Logic - ISSE RAKHA HAI) ---
+String aiScanner(String filename) {
+    File f = SD.open("/" + filename, FILE_READ);
+    if (!f) return "Unknown";
+    byte header[4];
+    f.read(header, 4);
+    f.close();
+    
+    if (header[0] == 0xFF && header[1] == 0xD8) return "📸 Image (JPEG)";
+    if (header[0] == 0x89 && header[1] == 0x50) return "📸 Image (PNG)";
+    if (header[0] == 0x25 && header[1] == 0x50 && header[2] == 0x44) return "📄 Document (PDF)";
+    if (header[0] == 0x50 && header[1] == 0x4B) return "📦 Archive/ZIP";
+    if (header[0] == 0x4D && header[1] == 0x5A) return "⚠️ EXE/Program"; // Tag badal diya, blocking nahi
+    if (filename.endsWith(".txt")) return "📝 Text File";
+    return "📁 General Data";
+}
+
+// --- SHARED CSS, JS & SOS BUTTON ---
+#define HEADER_CONTENT R"rawliteral(
+<style>
+  :root { --bg: #020617; --card: rgba(30, 41, 59, 0.7); --text: #f8fafc; --primary: #6366f1; --secondary: #a855f7; --border: rgba(255,255,255,0.1); --input: #0f172a; --danger: #ef4444; }
+  .light-mode { --bg: #f8fafc; --card: rgba(255, 255, 255, 0.9); --text: #0f172a; --border: rgba(0,0,0,0.1); --input: #f1f5f9; }
+  body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; transition: background 0.4s, color 0.4s; display: flex; justify-content: center; min-height: 100vh; overflow-x: hidden; }
+  .card { background: var(--card); backdrop-filter: blur(15px); padding: 30px; border-radius: 28px; border: 1px solid var(--border); width: 90%; max-width: 420px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); text-align: center; margin: 40px auto; position: relative; height: fit-content; }
+  .theme-toggle { position: fixed; top: 20px; right: 20px; background: var(--card); border: 1px solid var(--border); padding: 12px; border-radius: 50%; cursor: pointer; font-size: 20px; z-index: 1000; box-shadow: 0 4px 10px rgba(0,0,0,0.2); }
+  .sos-btn { position: fixed; bottom: 20px; right: 20px; background: var(--danger); color: white; border: none; width: 60px; height: 60px; border-radius: 50%; font-weight: 900; cursor: pointer; z-index: 2000; box-shadow: 0 0 20px rgba(239, 68, 68, 0.6); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+  .online-badge { position: absolute; top: 15px; left: 20px; font-size: 10px; font-weight: 700; opacity: 0.6; text-transform: uppercase; letter-spacing: 1px; }
+  h2 { font-size: 32px; font-weight: 800; margin: 10px 0 25px 0; background: linear-gradient(to right, var(--primary), var(--secondary)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  input { width: 100%; padding: 14px; margin: 10px 0; border-radius: 12px; border: 1px solid var(--border); background: var(--input); color: var(--text); font-size: 14px; outline: none; box-sizing: border-box; }
+  button { width: 100%; padding: 15px; margin-top: 15px; border-radius: 12px; border: none; background: linear-gradient(135deg, var(--primary), var(--secondary)); color: white; font-weight: 700; cursor: pointer; transition: 0.3s; }
+  .file-item { display: flex; flex-direction: column; align-items: flex-start; background: var(--input); padding: 12px 15px; border-radius: 14px; margin-bottom: 10px; border: 1px solid var(--border); }
+  .ai-tag { font-size: 9px; font-weight: 800; color: #10b981; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8; }
+  .search-box { background: var(--input); border: 1px solid var(--primary); margin-bottom: 20px; }
+  .link-btn { color: var(--primary); cursor: pointer; font-size: 13px; text-decoration: none; font-weight: 600; display: block; margin-top: 15px; }
+  .prog-container { width: 100%; background: var(--input); border-radius: 10px; height: 8px; margin: 10px 0; overflow: hidden; border: 1px solid var(--border); }
+  .prog-fill { height: 100%; background: linear-gradient(to right, var(--primary), var(--secondary)); width: 0%; transition: width 0.3s; }
+</style>
+<script>
+  let socket;
+  let siren = new Audio('/siren.mp3');
+  function toggleTheme() {
+    document.body.classList.toggle('light-mode');
+    localStorage.setItem('zenTheme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+  }
+  function applyTheme() {
+    if(localStorage.getItem('zenTheme') === 'light') document.body.classList.add('light-mode');
+    initSocket();
+  }
+  function initSocket() {
+    socket = new WebSocket('ws://'+window.location.hostname+'/ws');
+    socket.onmessage = (e) => {
+      if(e.data.startsWith('cnt:')) {
+        document.querySelectorAll('.online-val').forEach(b => b.innerText = e.data.split(':')[1]);
+      }
+      if(e.data === 'ALARM_ON') {
+          siren.play().catch(e => console.log('Audio wait for interaction'));
+          alert(' EMERGENCY SOS: HELP NEEDED! ');
+      }
+      if(typeof wsCustomHandler === 'function') wsCustomHandler(e.data);
+    };
+  }
+  function triggerSOS() { if(confirm('Trigger Emergency SOS for everyone?')) socket.send('SOS_TRIGGER'); }
+</script>
+<button class="sos-btn" onclick="triggerSOS()">SOS</button>
+)rawliteral"
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><title>ZenDrive Login</title><meta name='viewport' content='width=device-width, initial-scale=1'>
+)rawliteral" HEADER_CONTENT R"rawliteral(
+</head><body onload='applyTheme()'><div class='theme-toggle' onclick='toggleTheme()'>Dark/Light</div>
+<div id='main-container' class='card'>
+  <div class='online-badge'>Online: <span class='online-val'>0</span></div>
+  <h2>ZenDrive</h2>
+  <input type='email' id='ue' placeholder='Email Address'>
+  <input type='text' id='un' placeholder='Username'>
+  <input type='password' id='up' placeholder='Password'>
+  <button onclick='authStep1()'>LOGIN</button>
+  <a class='link-btn' onclick='showReg()'>Create Account</a>
+  <a class='link-btn' onclick='showForgot()'>Forgot Password?</a>
+  <a class='link-btn' style='opacity:0.3; font-size:10px;' onclick='adminLogin()'>Admin Panel</a>
+</div>
+<script>
+let currentEmail = ''; let qIdx = 0;
+function authStep1() {
+  currentEmail = document.getElementById('ue').value.toLowerCase();
+  fetch('/auth1?e='+encodeURIComponent(currentEmail)+'&u='+encodeURIComponent(document.getElementById('un').value.toLowerCase())+'&p='+encodeURIComponent(document.getElementById('up').value))
+  .then(r=>r.text()).then(t=>{ if(t.startsWith('Q:')){ let parts = t.split(':'); qIdx = parts[1]; show2FA(parts[2]); } else alert(t); });
+}
+function show2FA(q) {
+  document.getElementById('main-container').innerHTML = '<div class="online-badge">Online: <span class="online-val">0</span></div><h2>Security</h2><p>'+q+'</p><input type="text" id="2fa_a" placeholder="Your Answer"><button onclick="authStep2()">VERIFY</button>';
+}
+function authStep2() {
+  fetch('/auth2?e='+encodeURIComponent(currentEmail)+'&qi='+qIdx+'&a='+encodeURIComponent(document.getElementById('2fa_a').value.toLowerCase()))
+  .then(r=>r.text()).then(t=>{ if(t==='OK') window.location.href='/drive_page'; else alert('Wrong Answer'); });
+}
+function showReg() {
+  document.getElementById('main-container').innerHTML = '<h2>Join Us</h2><input type="email" id="re" placeholder="Email"><input type="text" id="ru" placeholder="Username"><input type="password" id="rp" placeholder="Password"><p style="font-size:12px;opacity:0.6">Security Setup:</p><input type="text" id="sa1" placeholder="Pet Name?"><input type="text" id="sa2" placeholder="Birth City?"><input type="text" id="sa3" placeholder="Fav Food?"><button onclick="regSubmit()">REGISTER</button><a class="link-btn" onclick="location.reload()">Back</a>';
+}
+function regSubmit() {
+  let p = 'e='+encodeURIComponent(document.getElementById('re').value.toLowerCase())+'&u='+encodeURIComponent(document.getElementById('ru').value.toLowerCase())+'&p='+encodeURIComponent(document.getElementById('rp').value)+'&a1='+encodeURIComponent(document.getElementById('sa1').value.toLowerCase())+'&a2='+encodeURIComponent(document.getElementById('sa2').value.toLowerCase())+'&a3='+encodeURIComponent(document.getElementById('sa3').value.toLowerCase());
+  fetch('/register?'+p).then(r=>r.text()).then(t=>{ alert(t); if(t==='Request Sent!') location.reload(); });
+}
+function showForgot() {
+  document.getElementById('main-container').innerHTML = '<h2>Recover</h2><input type="email" id="fe" placeholder="Your Email"><input type="text" id="fa1" placeholder="Pet Name?"><input type="text" id="fa2" placeholder="Birth City?"><input type="text" id="fa3" placeholder="Fav Food?"><input type="password" id="fnp" placeholder="New Password"><button onclick="resetPass()">RESET PASSWORD</button><a class="link-btn" onclick="location.reload()">Back</a>';
+}
+function resetPass() {
+  let p = 'e='+encodeURIComponent(document.getElementById('fe').value.toLowerCase())+'&a1='+encodeURIComponent(document.getElementById('fa1').value.toLowerCase())+'&a2='+encodeURIComponent(document.getElementById('fa2').value.toLowerCase())+'&a3='+encodeURIComponent(document.getElementById('fa3').value.toLowerCase())+'&np='+encodeURIComponent(document.getElementById('fnp').value);
+  fetch('/forgot?'+p).then(r=>r.text()).then(t=>{ alert(t); if(t==='Success') location.reload(); });
+}
+function adminLogin() {
+  let k = prompt('Master Key:');
+  if(k) fetch('/admin_auth?p='+encodeURIComponent(k)).then(r=>r.text()).then(t=>{ if(t.startsWith('OK')) window.location.href='/admin_page'; else alert('Denied'); });
+}
+</script></body></html>
+)rawliteral";
+
+const char drive_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><title>My Drive</title><meta name='viewport' content='width=device-width, initial-scale=1'>
+)rawliteral" HEADER_CONTENT R"rawliteral(
+</head><body onload='applyTheme(); load();'><div class='theme-toggle' onclick='toggleTheme()'>Dark/Light</div>
+<div class='card'><div class='online-badge'>Online: <span class='online-val'>0</span></div><h2>ZenDrive</h2>
+<div style="text-align:left; font-size:11px; margin-bottom:4px; opacity:0.8;">Storage: <span id="st_val">0/0</span> MB</div>
+<div class="prog-container"><div id="st_bar" class="prog-fill"></div></div>
+<input type="text" id="search" class="search-box" placeholder=" Search files..." onkeyup="filterFiles()">
+<button onclick="document.getElementById('f').click()">+ UPLOAD FILE</button>
+<input type='file' id='f' style='display:none' onchange='up()'>
+<div id="up_status" style="display:none; margin-top:15px; text-align:left;">
+  <div style="font-size:11px; margin-bottom:4px;">Uploading... <span id="up_pct">0%</span></div>
+  <div class="prog-container"><div id="up_bar" class="prog-fill" style="background:var(--secondary)"></div></div>
+</div>
+<div id='list' style='text-align:left; margin-top:20px;'></div>
+<a href='/' class='link-btn' style='color:#ef4444; margin-top:25px;'>Logout</a></div>
+<script>
+function wsCustomHandler(msg) { if(msg === 'upd') load(); }
+function up(){ 
+  let file = document.getElementById('f').files[0]; 
+  if(!file) return;
+  let fd = new FormData(); fd.append('file', file); 
+  let xhr = new XMLHttpRequest(); 
+  document.getElementById('up_status').style.display = 'block';
+  xhr.upload.onprogress = (e) => {
+    let p = Math.round((e.loaded / e.total) * 100);
+    document.getElementById('up_bar').style.width = p + '%';
+    document.getElementById('up_pct').innerText = p + '%';
+  };
+  xhr.open('POST', '/upload', true); 
+  xhr.onload = () => { 
+    document.getElementById('up_status').style.display = 'none'; 
+    load(); 
+  };
+  xhr.send(fd); 
+}
+function load(){ 
+  fetch('/stats').then(r=>r.json()).then(d=>{
+    document.getElementById('st_val').innerText = d.used + '/' + d.total;
+    document.getElementById('st_bar').style.width = d.pct + '%';
+  });
+  fetch('/list').then(r=>r.text()).then(t=>document.getElementById('list').innerHTML=t); 
+}
+function filterFiles() {
+  let val = document.getElementById('search').value.toLowerCase();
+  document.querySelectorAll('.file-item').forEach(item => {
+    item.style.display = item.innerText.toLowerCase().includes(val) ? 'flex' : 'none';
+  });
+}
+function delFile(n){ if(confirm('Delete?')) fetch('/delete?name='+n).then(()=>load()); }
+</script></body></html>
+)rawliteral";
+
+const char admin_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><title>Admin</title><meta name='viewport' content='width=device-width, initial-scale=1'>
+)rawliteral" HEADER_CONTENT R"rawliteral(
+</head><body onload='applyTheme(); load();'><div class='theme-toggle' onclick='toggleTheme()'>Dark/Light</div>
+<div class='card'><div class='online-badge'>Online: <span class='online-val'>0</span></div><h2>ZenAdmin</h2><div id='list'></div><button style='background:#64748b;' onclick="window.location.href='/'">EXIT ADMIN</button></div>
+<script>
+function wsCustomHandler(msg) { if(msg === 'new_user') load(); }
+function load(){ fetch('/get_pending').then(r=>r.text()).then(t=>document.getElementById('list').innerHTML=t || '<p style="opacity:0.5">No Requests</p>'); }
+function action(e, a){ fetch('/'+a+'?e='+e).then(()=>load()); }
+</script></body></html>
+)rawliteral";
+
+void broadcastOnlineCount() {
+    ws.textAll("cnt:" + String(ws.count()));
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    WiFi.softAP(ap_ssid, ap_pass, 11);
+    
+    SPI.begin(18, 19, 23, 5);
+    if(!SD.begin(SD_CS)) Serial.println("SD ERROR!");
+
+    ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len){
+        if(type == WS_EVT_CONNECT || type == WS_EVT_DISCONNECT) broadcastOnlineCount();
+        if(type == WS_EVT_DATA) {
+            data[len] = 0;
+            if(strcmp((char*)data, "SOS_TRIGGER") == 0) {
+                ws.textAll("ALARM_ON");
+                digitalWrite(BUZZER_PIN, HIGH);
+                delay(1000); 
+                digitalWrite(BUZZER_PIN, LOW);
+            }
+        }
+    });
+    server.addHandler(&ws);
+
+    if(!SD.exists("/users.txt")){
+        File f = SD.open("/users.txt", FILE_WRITE);
+        f.println("admin@zendrive.com|admin|" + String(hashed_master_key) + "|" + sha256("dog") + "|" + sha256("delhi") + "|" + sha256("pizza") + "|1");
+        f.close();
+    }
+
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", index_html); });
+    server.on("/drive_page", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", drive_html); });
+    server.on("/admin_page", HTTP_GET, [](AsyncWebServerRequest *r){ r->send_P(200, "text/html", admin_html); });
+    server.on("/siren.mp3", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(SD, "/siren.mp3", "audio/mpeg"); });
+
+    server.on("/stats", HTTP_GET, [](AsyncWebServerRequest *r){
+        float total = SD.totalBytes() / (1024.0 * 1024.0);
+        float used = SD.usedBytes() / (1024.0 * 1024.0);
+        int pct = (total > 0) ? (int)((used * 100) / total) : 0;
+        String json = "{\"total\":\"" + String(total, 1) + "\",\"used\":\"" + String(used, 2) + "\",\"pct\":" + String(pct) + "}";
+        r->send(200, "application/json", json);
+    });
+
+    server.on("/register", HTTP_GET, [](AsyncWebServerRequest *r){
+        String em = r->getParam("e")->value(); em.toLowerCase();
+        File f = SD.open("/users.txt", FILE_READ);
+        bool exists = false;
+        while(f.available()){ if(f.readStringUntil('\n').startsWith(em + "|")) { exists = true; break; } }
+        f.close();
+        if(exists) r->send(200, "text/plain", "Email already exists!");
+        else {
+            File fa = SD.open("/users.txt", FILE_APPEND);
+            String un = r->getParam("u")->value(); un.toLowerCase();
+            fa.println(em + "|" + un + "|" + sha256(r->getParam("p")->value()) + "|" + sha256(r->getParam("a1")->value()) + "|" + sha256(r->getParam("a2")->value()) + "|" + sha256(r->getParam("a3")->value()) + "|0");
+            fa.close(); ws.textAll("new_user"); r->send(200, "text/plain", "Request Sent!");
+        }
+    });
+
+    server.on("/auth1", HTTP_GET, [](AsyncWebServerRequest *r){
+        String em = r->getParam("e")->value(); em.toLowerCase();
+        String un = r->getParam("u")->value(); un.toLowerCase();
+        String ph = sha256(r->getParam("p")->value());
+        File f = SD.open("/users.txt"); String res = "Invalid Login";
+        while(f.available()){
+            String l = f.readStringUntil('\n'); l.trim();
+            if(l.startsWith(em + "|" + un + "|") && l.indexOf("|" + ph + "|") != -1){
+                if(l.endsWith("|1")){
+                    int qIdx = random(1, 4);
+                    String qText = (qIdx == 1) ? "Pet Name?" : (qIdx == 2) ? "Birth City?" : "Fav Food?";
+                    res = "Q:" + String(qIdx) + ":" + qText; 
+                } else res = "Approval Pending";
+                break;
+            }
+        }
+        f.close(); r->send(200, "text/plain", res);
+    });
+
+    server.on("/auth2", HTTP_GET, [](AsyncWebServerRequest *r){
+        String em = r->getParam("e")->value(); em.toLowerCase();
+        int qi = r->getParam("qi")->value().toInt();
+        String ah = sha256(r->getParam("a")->value());
+        File f = SD.open("/users.txt"); String res = "FAIL";
+        while(f.available()){
+            String l = f.readStringUntil('\n'); l.trim();
+            if(l.startsWith(em + "|")){
+                int p1 = l.indexOf('|'), p2 = l.indexOf('|', p1+1), p3 = l.indexOf('|', p2+1), p4 = l.indexOf('|', p3+1), p5 = l.indexOf('|', p4+1), p6 = l.indexOf('|', p5+1);
+                String ans = (qi==1)?l.substring(p3+1,p4):(qi==2)?l.substring(p4+1,p5):l.substring(p5+1,p6);
+                if(ans == ah) res = "OK";
+                break;
+            }
+        }
+        f.close(); r->send(200, "text/plain", res);
+    });
+
+    server.on("/forgot", HTTP_GET, [](AsyncWebServerRequest *r){
+        String em = r->getParam("e")->value(); em.toLowerCase();
+        String a1 = sha256(r->getParam("a1")->value()), a2 = sha256(r->getParam("a2")->value()), a3 = sha256(r->getParam("a3")->value());
+        String np = sha256(r->getParam("np")->value());
+        File f = SD.open("/users.txt"); String d = ""; bool found = false;
+        while(f.available()){
+            String l = f.readStringUntil('\n'); l.trim();
+            if(l.startsWith(em + "|")){
+                int p1 = l.indexOf('|'), p2 = l.indexOf('|', p1+1), p3 = l.indexOf('|', p2+1), p4 = l.indexOf('|', p3+1), p5 = l.indexOf('|', p4+1), p6 = l.indexOf('|', p5+1);
+                if(l.substring(p3+1,p4)==a1 && l.substring(p4+1,p5)==a2 && l.substring(p5+1,p6)==a3){
+                    l = l.substring(0, p2+1) + np + l.substring(p3); found = true;
+                }
+            }
+            if(l != "") d += l + "\n";
+        }
+        f.close();
+        if(found){ SD.remove("/users.txt"); File f2 = SD.open("/users.txt", FILE_WRITE); f2.print(d); f2.close(); r->send(200, "text/plain", "Success"); }
+        else r->send(200, "text/plain", "Wrong Details");
+    });
+
+    server.on("/list", HTTP_GET, [](AsyncWebServerRequest *r){
+        String l = ""; File root = SD.open("/"); File f = root.openNextFile();
+        while(f){
+            String n = String(f.name()); if(n.startsWith("/")) n.remove(0,1);
+            if(n != "users.txt" && n != "siren.mp3" && n != "") {
+                String aiType = aiScanner(n);
+                l += "<div class='file-item'><div style='display:flex;justify-content:space-between;width:100%;'><span>📄 " + n + "</span><div><a href='/download?name="+n+"' style='text-decoration:none;margin-right:10px;'>📥</a><span onclick=\"delFile('"+n+"')\" style='cursor:pointer;'>🗑️</span></div></div><div class='ai-tag'>✨ AI SCAN: " + aiType + "</div></div>";
+            }
+            f = root.openNextFile();
+        }
+        r->send(200, "text/plain", l==""?"Empty":l);
+    });
+
+    // --- UPLOAD HANDLER (AI Guard Block Hata Diya - No Crashes) ---
+    server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *r){ 
+        r->send(200); 
+    }, [](AsyncWebServerRequest *r, String filename, size_t index, uint8_t *data, size_t len, bool final){
+        if(!index) {
+            SD.remove("/" + filename);
+            r->_tempFile = SD.open("/" + filename, FILE_WRITE);
+        }
+        if(r->_tempFile) {
+            if(len) r->_tempFile.write(data, len);
+            if(final) { 
+                r->_tempFile.close(); 
+                ws.textAll("upd"); 
+            }
+        }
+    });
+
+    server.on("/download", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(SD, "/" + r->getParam("name")->value(), "application/octet-stream", true); });
+    server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *r){ SD.remove("/" + r->getParam("name")->value()); ws.textAll("upd"); r->send(200); });
+    server.on("/admin_auth", HTTP_GET, [](AsyncWebServerRequest *r){ if(sha256(r->getParam("p")->value()) == String(hashed_master_key)) r->send(200, "text/plain", "OK"); else r->send(200, "text/plain", "Error"); });
+    
+    server.on("/get_pending", HTTP_GET, [](AsyncWebServerRequest *r){
+        String h = ""; File f = SD.open("/users.txt");
+        while(f.available()){
+            String l = f.readStringUntil('\n'); l.trim();
+            if(l.endsWith("|0")){ int s1 = l.indexOf('|'); String em = l.substring(0, s1); h += "<div class='file-item'><span>"+em+"</span><div><button style='width:auto;padding:5px 10px;margin:0;display:inline;' onclick=\"action('"+em+"','approve')\">✔</button><button style='width:auto;padding:5px 10px;margin:0 0 0 5px;display:inline;background:#ef4444;' onclick=\"action('"+em+"','reject')\">✖</button></div></div>"; }
+        }
+        f.close(); r->send(200, "text/plain", h);
+    });
+
+    server.on("/approve", HTTP_GET, [](AsyncWebServerRequest *r){
+        String em = r->getParam("e")->value(); em.toLowerCase();
+        File f = SD.open("/users.txt"); String d = "";
+        while(f.available()){ String l = f.readStringUntil('\n'); l.trim(); if(l.startsWith(em + "|") && l.endsWith("|0")) l.replace("|0", "|1"); if(l != "") d += l + "\n"; }
+        f.close(); SD.remove("/users.txt"); File f2 = SD.open("/users.txt", FILE_WRITE); f2.print(d); f2.close(); r->send(200);
+    });
+
+    server.on("/reject", HTTP_GET, [](AsyncWebServerRequest *r){
+        String em = r->getParam("e")->value(); em.toLowerCase();
+        File f = SD.open("/users.txt"); String d = "";
+        while(f.available()){ String l = f.readStringUntil('\n'); l.trim(); if(!l.startsWith(em + "|")) { if(l != "") d += l + "\n"; } }
+        f.close(); SD.remove("/users.txt"); File f2 = SD.open("/users.txt", FILE_WRITE); f2.print(d); f2.close(); r->send(200);
+    });
+
+    server.begin();
+}
+
+void loop() { ws.cleanupClients(); }
